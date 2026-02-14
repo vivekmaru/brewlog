@@ -473,13 +473,28 @@ brewlog/
 
 ## Architectural Decisions & Trade-offs
 
-### 1. SQLite — Local-First, Single-User
+### v1 Scope & Priorities
 
-**Decision**: Use SQLite via `better-sqlite3` instead of PostgreSQL or a cloud database.
+The following improvements are planned for v1:
 
-**Rationale**: BrewLog is a personal tool. SQLite gives us zero-config setup, a single database file that can be backed up by copying, and excellent read performance. No need for a separate database server.
+| Priority | Feature | Rationale |
+|----------|---------|-----------|
+| High | Pagination for API list endpoints | Prevents performance degradation with many brews |
+| High | Soft deletes (deleted_at) | Prevents accidental data loss, enables undo |
 
-**Trade-off**: Not suitable for multi-user or concurrent write-heavy workloads. If multi-user support is needed later, migration to PostgreSQL via Drizzle would be straightforward since Drizzle abstracts the dialect.
+The following are explicitly deferred to v2:
+- Security hardening beyond API key (personal use, single user)
+- Observability (logging, health checks, error tracking)
+
+---
+
+### 1. React 19 SPA + Serverless API Over Next.js
+
+**Decision**: Use a React 19 SPA (Vite) with a separate serverless API instead of a Next.js monolith.
+
+**Rationale**: Decoupling frontend and backend allows independent deployment, scaling, and technology choices. The static frontend can be hosted for free on any CDN. The serverless API scales to zero and stays within free tiers. No vendor lock-in to a specific framework's deployment model.
+
+**Trade-off**: No server-side rendering — the app is fully client-rendered. Acceptable for a personal tool where SEO is irrelevant. Requires managing CORS between frontend and API.
 
 ### 2. No Authentication
 
@@ -547,6 +562,7 @@ brewlog/
 
 These are explicitly out of scope for v1 but worth noting:
 
+### v2 Features
 - **Recipe templates**: Save and reuse ingredient lists
 - **Batch cloning**: Duplicate a brew as a starting point
 - **Photo attachments**: Add photos to events — e.g. fermentation activity, color checks
@@ -554,3 +570,5 @@ These are explicitly out of scope for v1 but worth noting:
 - **Multi-user / sharing**: Add auth and share read-only brew pages
 - **PWA support**: Offline access and home screen install for mobile
 - **Notifications**: Reminders for gravity checks or dry hop schedules
+- **tRPC migration**: Replace REST with tRPC for end-to-end type safety between frontend and API
+- **Observability**: API logging, health checks, error tracking

@@ -12,19 +12,21 @@
 4. [Route / Page Structure](#route--page-structure)
 5. [Component Architecture](#component-architecture)
 6. [API Layer](#api-layer)
-7. [QR Code Flow](#qr-code-flow)
-8. [Project File / Folder Structure](#project-file--folder-structure)
-9. [Deployment Architecture](#deployment-architecture)
-10. [Key npm Dependencies](#key-npm-dependencies)
-11. [Architectural Decisions & Trade-offs](#architectural-decisions--trade-offs)
+7. [Authentication & Access Model](#authentication--access-model)
+8. [QR Code Flow](#qr-code-flow)
+9. [Offline Support & Local Caching](#offline-support--local-caching)
+10. [Project File / Folder Structure](#project-file--folder-structure)
+11. [Deployment Architecture](#deployment-architecture)
+12. [Key npm Dependencies](#key-npm-dependencies)
+13. [Architectural Decisions & Trade-offs](#architectural-decisions--trade-offs)
 
 ---
 
 ## Overview
 
-BrewLog is a single-user web application for tracking homebrew batches of beer, mead, and cider. Users create brews, log ingredients, record fermentation events over time, and generate QR codes to attach to fermenters for quick mobile access.
+BrewLog is a **single-user** web application for tracking homebrew batches of beer, mead, and cider. The owner creates brews, logs ingredients, records fermentation events over time, and generates QR codes to attach to fermenters for quick mobile access.
 
-All measurements use the **metric system** — liters for volume, grams/kilograms for weight, and Celsius for temperature.
+All measurements use the **metric system** — liters (L) for volume, grams (g) / kilograms (kg) for weight, and Celsius (°C) for temperature.
 
 ### Core Workflow
 
@@ -50,10 +52,11 @@ flowchart LR
 | Server State | TanStack Query (React Query) | Caching, background refetching, optimistic updates |
 | Local State | Zustand | Lightweight, minimal boilerplate |
 | Styling | Tailwind CSS + shadcn/ui | Rapid UI development with accessible components |
-| Backend API | Cloudflare Workers / AWS Lambda / Supabase Edge Functions | Serverless, free-tier friendly |
-| Database | Supabase PostgreSQL | Managed PostgreSQL with generous free tier |
-| ORM | Drizzle ORM (with serverless adapter) | Type-safe, lightweight, serverless-compatible |
-| Auth | Supabase Auth | Free tier, built-in with Supabase |
+| Backend API | Cloudflare Workers / Vercel Functions / Netlify Functions | Serverless, free-tier friendly |
+| Database | PostgreSQL (self-hosted, always-on) | Owner-provided Postgres server via connection string |
+| ORM | Drizzle ORM (with `postgres-js` adapter) | Type-safe, lightweight, serverless-compatible |
+| Auth | API key (simple header-based) | Single-user app — no OAuth/JWT complexity needed |
+| Offline | Service Worker + IndexedDB | Local caching and sync-later for spotty WiFi |
 | QR Codes | `qrcode.react` | Client-side QR generation as React component |
 
 ---
@@ -69,6 +72,7 @@ erDiagram
 
     BREWS {
         text id PK
+        text user_id
         text name
         text type
         real batch_size_liters
@@ -85,6 +89,7 @@ erDiagram
     INGREDIENTS {
         text id PK
         text brew_id FK
+        text user_id
         text category
         text name
         real quantity
@@ -97,6 +102,7 @@ erDiagram
     FERMENTATION_EVENTS {
         text id PK
         text brew_id FK
+        text user_id
         text event_type
         real gravity
         real temperature_celsius
@@ -113,9 +119,10 @@ erDiagram
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
 | `id` | `text` | PK, nanoid | Unique brew identifier |
+| `user_id` | `text` | NOT NULL, DEFAULT `'default'` | Owner identifier (single user, for data hygiene and future-proofing) |
 | `name` | `text` | NOT NULL | Brew name |
 | `type` | `text` | NOT NULL | `beer`, `mead`, or `cider` |
-| `batch_size_liters` | `real` | NOT NULL | Batch size in liters |
+| `batch_size_liters` | `real` | NOT NULL | Batch size in liters (L) |
 | `target_og` | `real` | | Target original gravity |
 | `target_fg` | `real` | | Target final gravity |
 | `status` | `text` | NOT NULL, DEFAULT `fermenting` | One of: `planning`, `fermenting`, `conditioning`, `bottled`, `done` |
@@ -131,10 +138,11 @@ erDiagram
 |--------|------|-------------|-------------|
 | `id` | `text` | PK, nanoid | Unique ingredient identifier |
 | `brew_id` | `text` | FK → brews.id, NOT NULL | Parent brew |
+| `user_id` | `text` | NOT NULL, DEFAULT `'default'` | Owner identifier (for data hygiene) |
 | `category` | `text` | NOT NULL | `grain`, `hop`, `honey`, `fruit`, `yeast`, `adjunct`, `other` |
 | `name` | `text` | NOT NULL | Ingredient name |
-| `quantity` | `real` | NOT NULL | Amount |
-| `unit` | `text` | NOT NULL | `g`, `kg`, `ml`, `L`, `tsp`, `tbsp`, `pkg`, `each` |
+| `quantity` | `real` | NOT NULL | Amount (metric) |
+| `unit` | `text` | NOT NULL | `g`, `kg`, `ml`, `L` |
 | `date_added` | `text` | | ISO 8601 date — when added to the brew |
 | `notes` | `text` | | e.g. boil time, dry hop duration |
 | `created_at` | `timestamptz` | NOT NULL, DEFAULT now() | ISO 8601 timestamp |
@@ -145,6 +153,7 @@ erDiagram
 |--------|------|-------------|-------------|
 | `id` | `text` | PK, nanoid | Unique event identifier |
 | `brew_id` | `text` | FK → brews.id, NOT NULL | Parent brew |
+| `user_id` | `text` | NOT NULL, DEFAULT `'default'` | Owner identifier (for data hygiene) |
 | `event_type` | `text` | NOT NULL | `gravity_reading`, `temperature`, `racking`, `addition`, `tasting`, `note`, `bottling`, `other` |
 | `gravity` | `real` | | Specific gravity reading |
 | `temperature_celsius` | `real` | | Temperature in °C |
@@ -155,10 +164,13 @@ erDiagram
 ### Drizzle Schema Notes
 
 - All IDs use `nanoid` — short, URL-safe, collision-resistant.
+- All tables include a `user_id` column defaulting to `'default'` for data hygiene and future-proofing, even though this is a single-user app.
 - Timestamps use PostgreSQL `timestamptz` for native timezone-aware date handling.
 - Foreign keys enforced via Drizzle relations and PostgreSQL constraints.
 - Indexes on `ingredients.brew_id` and `fermentation_events.brew_id` for query performance.
 - Drizzle ORM is used with the `drizzle-orm/postgres-js` adapter for serverless compatibility.
+- The database is the owner's self-hosted, always-on PostgreSQL server, connected via a standard `DATABASE_URL` connection string.
+- All units are strictly metric: `g`, `kg`, `ml`, `L` for quantity; `°C` for temperature; `L` for volume.
 
 ---
 
@@ -186,16 +198,16 @@ src/routes/
 
 ### Route Summary
 
-| Route | Purpose | Key Features |
-|-------|---------|-------------|
-| `/` | Dashboard | Brew cards grouped by status, search/filter |
-| `/brews/new` | Create brew | Form with type selector, batch params (liters) |
-| `/brews/:brewId` | Brew summary | Overview stats, latest readings, ABV calc |
-| `/brews/:brewId/ingredients` | Ingredients | Table of ingredients, add/edit/delete |
-| `/brews/:brewId/log` | Fermentation log | Timeline of events, add new entries |
-| `/brews/:brewId/qr` | QR code | Generate, display, download QR |
-| `/brews/:brewId/edit` | Edit brew | Update brew metadata and status |
-| `/quick-log/:brewId` | Quick-add entry | Mobile-first form reached via QR scan |
+| Route | Purpose | Access | Key Features |
+|-------|---------|--------|-------------|
+| `/` | Dashboard | Authenticated | Brew cards grouped by status, search/filter |
+| `/brews/new` | Create brew | Authenticated | Form with type selector, batch params (L) |
+| `/brews/:brewId` | Brew summary | Public (read-only) | Overview stats, latest readings, ABV calc |
+| `/brews/:brewId/ingredients` | Ingredients | Public (read-only) | Table of ingredients |
+| `/brews/:brewId/log` | Fermentation log | Public (read-only) | Timeline of events |
+| `/brews/:brewId/qr` | QR code | Authenticated | Generate, display, download QR |
+| `/brews/:brewId/edit` | Edit brew | Authenticated | Update brew metadata and status |
+| `/quick-log/:brewId` | Quick-add entry | Authenticated | Mobile-first form reached via QR scan |
 
 ---
 
@@ -231,7 +243,7 @@ src/routes/
 | Component | File | Responsibility |
 |-----------|------|---------------|
 | `BrewForm` | `src/components/forms/brew-form.tsx` | Create/edit brew form |
-| `IngredientForm` | `src/components/forms/ingredient-form.tsx` | Add/edit ingredient (metric units) |
+| `IngredientForm` | `src/components/forms/ingredient-form.tsx` | Add/edit ingredient (metric units: g, kg, ml, L) |
 | `EventForm` | `src/components/forms/event-form.tsx` | Add fermentation event (°C) |
 | `QuickLogForm` | `src/components/forms/quick-log-form.tsx` | Simplified mobile event form |
 
@@ -266,45 +278,74 @@ All shadcn/ui primitives live in `src/components/ui/` — Button, Card, Input, S
 
 ## API Layer
 
-The backend is a serverless API deployed to one of the supported free-tier providers. It exposes RESTful endpoints consumed by the React frontend via TanStack Query.
+The backend is a serverless API deployed to one of the supported free-tier providers (Cloudflare Workers, Vercel Functions, or Netlify Functions). It exposes RESTful endpoints consumed by the React frontend via TanStack Query.
 
 ### API Endpoints
 
 #### Brews — `/api/brews`
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/brews` | List all brews, ordered by updated_at desc |
-| `GET` | `/api/brews/:brewId` | Get single brew with ingredient + event counts |
-| `POST` | `/api/brews` | Create a new brew |
-| `PUT` | `/api/brews/:brewId` | Update brew metadata |
-| `PATCH` | `/api/brews/:brewId/status` | Change brew status |
-| `DELETE` | `/api/brews/:brewId` | Delete brew and cascade ingredients/events |
+| Method | Endpoint | Auth Required | Description |
+|--------|----------|---------------|-------------|
+| `GET` | `/api/brews` | No | List all brews, ordered by updated_at desc |
+| `GET` | `/api/brews/:brewId` | No | Get single brew with ingredient + event counts |
+| `POST` | `/api/brews` | **Yes** | Create a new brew |
+| `PUT` | `/api/brews/:brewId` | **Yes** | Update brew metadata |
+| `PATCH` | `/api/brews/:brewId/status` | **Yes** | Change brew status |
+| `DELETE` | `/api/brews/:brewId` | **Yes** | Delete brew and cascade ingredients/events |
 
 #### Ingredients — `/api/brews/:brewId/ingredients`
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/brews/:brewId/ingredients` | List all ingredients for a brew |
-| `POST` | `/api/brews/:brewId/ingredients` | Add ingredient to brew |
-| `PUT` | `/api/brews/:brewId/ingredients/:id` | Edit ingredient |
-| `DELETE` | `/api/brews/:brewId/ingredients/:id` | Remove ingredient |
+| Method | Endpoint | Auth Required | Description |
+|--------|----------|---------------|-------------|
+| `GET` | `/api/brews/:brewId/ingredients` | No | List all ingredients for a brew |
+| `POST` | `/api/brews/:brewId/ingredients` | **Yes** | Add ingredient to brew |
+| `PUT` | `/api/brews/:brewId/ingredients/:id` | **Yes** | Edit ingredient |
+| `DELETE` | `/api/brews/:brewId/ingredients/:id` | **Yes** | Remove ingredient |
 
 #### Fermentation Events — `/api/brews/:brewId/events`
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/brews/:brewId/events` | List all events for a brew, ordered by event_date |
-| `POST` | `/api/brews/:brewId/events` | Log a fermentation event |
-| `DELETE` | `/api/brews/:brewId/events/:id` | Remove an event |
+| Method | Endpoint | Auth Required | Description |
+|--------|----------|---------------|-------------|
+| `GET` | `/api/brews/:brewId/events` | No | List all events for a brew, ordered by event_date |
+| `POST` | `/api/brews/:brewId/events` | **Yes** | Log a fermentation event |
+| `DELETE` | `/api/brews/:brewId/events/:id` | **Yes** | Remove an event |
 
 ### Validation
 
 All request bodies are validated using Zod schemas on the serverless API before database operations. The same Zod schemas can be shared between frontend and backend via a shared package or copy.
 
-### Authentication
+---
 
-API endpoints are protected by Supabase Auth. The frontend obtains a JWT from Supabase Auth and sends it as a `Bearer` token in the `Authorization` header. The serverless API validates the JWT against Supabase's JWKS endpoint.
+## Authentication & Access Model
+
+BrewLog is a **single-user personal app**. Authentication is intentionally simple — no OAuth, no JWT, no user registration flows.
+
+### Write Operations — API Key
+
+All write operations (`POST`, `PUT`, `PATCH`, `DELETE`) require a static API key sent as a request header:
+
+```
+X-API-Key: <your-secret-api-key>
+```
+
+The API key is set as an environment variable on the serverless API (`API_KEY`). The auth middleware checks for this header on all mutating requests and returns `401 Unauthorized` if it is missing or incorrect.
+
+The frontend stores the API key in the browser's `localStorage` after the user enters it once (a simple "unlock" prompt on first visit). All subsequent API requests from the frontend include the key automatically via the fetch wrapper.
+
+### Read Operations — Public
+
+All `GET` endpoints are **public and unauthenticated**. This enables the QR code access model: anyone who scans a QR code on a fermenter can view the brew details, ingredients, and fermentation log without needing credentials.
+
+### Access Summary
+
+| Operation | Auth Required | Use Case |
+|-----------|---------------|----------|
+| Read brew details | No | QR code scanning, public viewing |
+| Read ingredients | No | QR code scanning, public viewing |
+| Read fermentation log | No | QR code scanning, public viewing |
+| Create/edit/delete brews | **Yes** (API key) | Owner only |
+| Create/edit/delete ingredients | **Yes** (API key) | Owner only |
+| Log/delete fermentation events | **Yes** (API key) | Owner only |
 
 ---
 
@@ -314,14 +355,16 @@ API endpoints are protected by Supabase Auth. The frontend obtains a JWT from Su
 
 1. When a brew is created, a unique `id` is assigned via `nanoid`.
 2. On the `/brews/:brewId/qr` page, the QR code is generated **client-side** using the `qrcode.react` library.
-3. The QR encodes the URL: `{APP_BASE_URL}/quick-log/{brewId}`
+3. The QR encodes the URL: `{APP_BASE_URL}/brews/{brewId}`
 4. `APP_BASE_URL` is set via the `VITE_APP_URL` environment variable — defaults to `http://localhost:5173` in development.
 
 ### URL Format
 
 ```
-https://your-domain.com/quick-log/abc123nanoid
+https://your-domain.com/brews/abc123nanoid
 ```
+
+QR codes link to the **read-only brew detail page**, not the quick-log page. This means anyone scanning the QR can view brew details without authentication. The owner can navigate to the quick-log form from the brew detail page when authenticated.
 
 ### QR Display Page Features
 
@@ -334,21 +377,22 @@ https://your-domain.com/quick-log/abc123nanoid
 
 ```mermaid
 flowchart TD
-    A[User scans QR on fermenter] --> B[Phone opens /quick-log/brewId]
+    A[User scans QR on fermenter] --> B[Phone opens /brews/brewId]
     B --> C{Brew exists?}
-    C -->|Yes| D[Show quick-log form]
+    C -->|Yes| D[Show brew detail page - read-only]
     C -->|No| E[Show 404 with link to dashboard]
-    D --> F[User selects event type]
-    F --> G[User fills in reading/notes]
-    G --> H[Submit]
-    H --> I[Toast: Event logged]
-    I --> J[Form resets for next entry]
-    J --> K[Optional: View full brew log link]
+    D --> F{Owner authenticated?}
+    F -->|Yes| G[Show quick-log button]
+    F -->|No| H[Read-only view only]
+    G --> I[Navigate to quick-log form]
+    I --> J[User fills in reading/notes]
+    J --> K[Submit with API key]
+    K --> L[Toast: Event logged]
 ```
 
 ### Quick-Log Page Design
 
-The `/quick-log/:brewId` page is optimized for mobile:
+The `/quick-log/:brewId` page is optimized for mobile and **requires authentication** (API key):
 
 - **Header**: Brew name and current status
 - **Event type selector**: Large tap targets — Gravity, Temperature, Tasting, Racking, Addition, Note
@@ -362,6 +406,60 @@ The `/quick-log/:brewId` page is optimized for mobile:
 - **Date/time**: Defaults to now, editable
 - **Submit button**: Large, prominent
 - **Success state**: Toast notification, form resets, link to full log
+
+---
+
+## Offline Support & Local Caching
+
+Since the app is used at the fermenter where WiFi may be spotty, BrewLog includes offline support via Service Worker and IndexedDB.
+
+### Architecture
+
+```mermaid
+flowchart TD
+    A[User opens app] --> B{Online?}
+    B -->|Yes| C[Fetch from API]
+    C --> D[Cache response in IndexedDB]
+    B -->|No| E[Serve from IndexedDB cache]
+    
+    F[User submits form offline] --> G[Save to IndexedDB outbox]
+    G --> H{Online?}
+    H -->|Yes| I[Sync outbox to API]
+    H -->|No| J[Queue for later sync]
+    
+    K[Connection restored] --> L[Background sync triggers]
+    L --> I
+    I --> M[Clear synced items from outbox]
+```
+
+### Implementation Details
+
+| Concern | Technology | Details |
+|---------|-----------|---------|
+| **Service Worker** | Vite PWA plugin (`vite-plugin-pwa`) | Caches static assets (HTML, JS, CSS) for offline shell loading |
+| **Data Cache** | IndexedDB (via `idb` library) | Stores API responses locally — brew list, brew details, ingredients, events |
+| **Offline Writes** | IndexedDB outbox queue | When offline, write operations are saved to an "outbox" store in IndexedDB |
+| **Background Sync** | Service Worker Background Sync API | When connectivity is restored, queued writes are replayed to the API in order |
+| **Conflict Resolution** | Last-write-wins | Simple strategy — the most recent write wins. Acceptable for single-user app |
+| **Sync Status UI** | Zustand store + toast notifications | Shows pending sync count, notifies on successful sync |
+
+### Offline Capabilities
+
+| Feature | Offline Support |
+|---------|----------------|
+| View dashboard / brew list | ✅ Cached data from last online visit |
+| View brew details, ingredients, events | ✅ Cached data |
+| Log a fermentation event | ✅ Queued in outbox, synced when online |
+| Create a new brew | ✅ Queued in outbox, synced when online |
+| Add ingredients | ✅ Queued in outbox, synced when online |
+| Generate/view QR code | ✅ Client-side generation, works offline |
+| Delete operations | ⚠️ Queued but may conflict — user warned |
+
+### Cache Freshness
+
+- TanStack Query's `staleTime` and `gcTime` settings control how long cached data is considered fresh.
+- On reconnection, a full refetch is triggered for any stale queries.
+- IndexedDB cache is updated on every successful API response.
 
 ---
 
@@ -411,28 +509,32 @@ brewlog/
 │   │   │   ├── qr-code-display.tsx
 │   │   │   ├── qr-download-button.tsx
 │   │   │   ├── qr-print-button.tsx
-│   │   │   └── status-filter.tsx
+│   │   │   ├── status-filter.tsx
+│   │   │   └── sync-status.tsx     # Shows offline queue status
 │   │   ├── layouts/
 │   │   │   ├── root-layout.tsx
 │   │   │   └── brew-detail-layout.tsx
 │   │   ├── lib/
-│   │   │   ├── api-client.ts       # Fetch wrapper for API calls
+│   │   │   ├── api-client.ts       # Fetch wrapper with API key header
 │   │   │   ├── queries.ts          # TanStack Query hooks
 │   │   │   ├── mutations.ts        # TanStack Query mutation hooks
 │   │   │   ├── store.ts            # Zustand store(s)
+│   │   │   ├── offline.ts          # IndexedDB cache + outbox logic
+│   │   │   ├── sync.ts             # Background sync orchestration
 │   │   │   ├── utils.ts            # Shared utilities (ABV calc, date formatting)
 │   │   │   ├── types.ts            # Shared TypeScript types/enums
 │   │   │   └── validators.ts       # Zod schemas for form validation
+│   │   ├── sw.ts                   # Service Worker registration
 │   │   └── assets/                 # Static assets (icons, images)
 │   ├── public/
 │   │   └── icons/                  # App icons, favicon
-│   ├── .env                        # VITE_APP_URL, VITE_API_URL, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
-│   ├── vite.config.ts              # Vite configuration
+│   ├── .env                        # VITE_APP_URL, VITE_API_URL
+│   ├── vite.config.ts              # Vite configuration (with PWA plugin)
 │   ├── tailwind.config.ts          # Tailwind configuration
 │   ├── tsconfig.json
 │   └── package.json
 │
-├── api/                            # Serverless API (Cloudflare Workers / AWS Lambda / Supabase Edge Functions)
+├── api/                            # Serverless API (Cloudflare Workers / Vercel Functions / Netlify Functions)
 │   ├── src/
 │   │   ├── index.ts                # Entry point / router
 │   │   ├── routes/
@@ -444,7 +546,7 @@ brewlog/
 │   │   │   ├── schema.ts           # Drizzle table definitions
 │   │   │   └── migrations/         # Generated migration files
 │   │   ├── middleware/
-│   │   │   └── auth.ts             # Supabase JWT validation middleware
+│   │   │   └── auth.ts             # API key validation middleware
 │   │   ├── validators.ts           # Zod schemas for request validation
 │   │   └── types.ts                # Shared TypeScript types
 │   ├── wrangler.toml               # Cloudflare Workers config (if using CF Workers)
@@ -459,12 +561,12 @@ brewlog/
 
 ## Deployment Architecture
 
-The application is split into three independently deployed tiers, all using free-tier services:
+The application is split into three independently deployed tiers:
 
 ```mermaid
 flowchart TB
     subgraph Client
-        A[React 19 SPA<br/>Static Files]
+        A[React 19 SPA<br/>Static Files<br/>+ Service Worker]
     end
 
     subgraph Static Host
@@ -472,20 +574,16 @@ flowchart TB
     end
 
     subgraph Serverless API
-        C[Cloudflare Workers<br/>OR AWS Lambda + API Gateway<br/>OR Supabase Edge Functions]
+        C[Cloudflare Workers<br/>OR Vercel Functions<br/>OR Netlify Functions]
     end
 
     subgraph Data Layer
-        D[Supabase PostgreSQL]
-        E[Supabase Auth]
-        F[Supabase Storage<br/>OR Cloudflare R2<br/>optional]
+        D[PostgreSQL<br/>Self-hosted, always-on]
     end
 
     A -->|Deployed to| B
-    B -->|API requests| C
-    C -->|Drizzle ORM| D
-    C -->|JWT validation| E
-    C -->|File uploads| F
+    B -->|API requests<br/>+ API key header| C
+    C -->|Drizzle ORM<br/>via connection string| D
 ```
 
 ### Free-Tier Provider Options
@@ -496,16 +594,9 @@ flowchart TB
 | | Netlify | 100 GB bandwidth/month, 300 build minutes/month |
 | | Vercel (static) | 100 GB bandwidth/month |
 | **Serverless API** | Cloudflare Workers | 100,000 requests/day, 10 ms CPU time |
-| | AWS Lambda + API Gateway | 1M requests/month, 400,000 GB-seconds compute |
-| | Supabase Edge Functions | 500,000 invocations/month, 50 MB script size |
-| **Database** | Supabase PostgreSQL | 500 MB storage, 2 GB bandwidth/month |
-| | Neon PostgreSQL | 512 MB storage, 190 compute hours/month |
-| | PlanetScale (MySQL) | 1 GB storage, 1B row reads/month |
-| | Turso (libSQL) | 9 GB storage, 500M row reads/month |
-| **Auth** | Supabase Auth | 50,000 monthly active users |
-| | Clerk | 10,000 monthly active users |
-| **File Storage** | Supabase Storage | 1 GB storage, 2 GB bandwidth/month |
-| | Cloudflare R2 | 10 GB storage, 10M reads/month |
+| | Vercel Functions | 100 GB-hours/month, 100,000 invocations/day |
+| | Netlify Functions | 125,000 requests/month, 100 hours/month |
+| **Database** | Self-hosted PostgreSQL | Owner-provided, always-on server |
 
 ### Environment Variables
 
@@ -513,15 +604,12 @@ flowchart TB
 ```
 VITE_APP_URL=https://brewlog.pages.dev
 VITE_API_URL=https://api.brewlog.workers.dev
-VITE_SUPABASE_URL=https://xxxxx.supabase.co
-VITE_SUPABASE_ANON_KEY=eyJ...
 ```
 
 **API** (environment/secrets):
 ```
-DATABASE_URL=postgresql://...
-SUPABASE_JWT_SECRET=...
-SUPABASE_URL=https://xxxxx.supabase.co
+DATABASE_URL=postgresql://user:password@your-server:5432/brewlog
+API_KEY=your-secret-api-key
 ```
 
 ---
@@ -543,7 +631,8 @@ SUPABASE_URL=https://xxxxx.supabase.co
 | `lucide-react` | Icon library — used by shadcn/ui |
 | `class-variance-authority` | Component variant styling — shadcn/ui dependency |
 | `clsx` / `tailwind-merge` | Conditional class name utilities |
-| `@supabase/supabase-js` | Supabase client for auth |
+| `idb` | Lightweight IndexedDB wrapper for offline caching |
+| `vite-plugin-pwa` | Service Worker generation and PWA support |
 
 ### Frontend — Development
 
@@ -563,7 +652,6 @@ SUPABASE_URL=https://xxxxx.supabase.co
 | `postgres` | PostgreSQL driver (serverless-compatible) |
 | `nanoid` | Short unique ID generation |
 | `zod` | Request body validation |
-| `jose` | JWT validation for Supabase Auth tokens |
 
 ### API — Development
 
@@ -585,47 +673,55 @@ SUPABASE_URL=https://xxxxx.supabase.co
 
 **Trade-off**: No server-side rendering — the app is fully client-rendered. Acceptable for a personal tool where SEO is irrelevant. Requires managing CORS between frontend and API.
 
-### 2. Supabase PostgreSQL Over SQLite
+### 2. Self-Hosted PostgreSQL Over Managed Services
 
-**Decision**: Use Supabase PostgreSQL instead of SQLite.
+**Decision**: Use the owner's self-hosted, always-on PostgreSQL server instead of a managed database service.
 
-**Rationale**: A serverless API cannot use SQLite (no persistent filesystem). Supabase provides a managed PostgreSQL instance with a generous free tier (500 MB), built-in auth, and real-time capabilities if needed later. Drizzle ORM abstracts the dialect, so the schema remains clean.
+**Rationale**: The owner already has an always-on Postgres server available. Direct connection via a standard `DATABASE_URL` connection string keeps things simple. No vendor lock-in, no managed service limitations, no free-tier constraints. Drizzle ORM connects via the `postgres-js` driver, which works well in serverless environments.
 
-**Trade-off**: Requires network access to the database. Slightly higher latency than local SQLite, but negligible for a personal app.
+**Trade-off**: The owner is responsible for database backups, updates, and availability. Acceptable since this is a personal app and the server is already maintained.
 
-### 3. Metric Units Only
+### 3. Simple API Key Auth Over OAuth/JWT
 
-**Decision**: All measurements use metric units exclusively — liters, grams, kilograms, Celsius.
+**Decision**: Use a static API key header for write operations instead of OAuth, JWT, or any user registration system.
 
-**Rationale**: Metric is the international standard and simplifies the data model by eliminating unit conversion logic and dual-unit storage. No `temperature_unit` column needed; temperature is always Celsius. No `lb`/`oz` in the unit enum.
+**Rationale**: This is a single-user personal app. There is no need for user registration, login flows, token refresh logic, or session management. A simple `X-API-Key` header on mutating requests is sufficient. Read operations are public to support the QR code access model.
 
-**Trade-off**: Users accustomed to imperial units (gallons, pounds, Fahrenheit) will need to convert. A client-side display toggle could be added later without changing the database schema.
+**Trade-off**: The API key must be kept secret. It's stored in the browser's `localStorage` and sent over HTTPS. If compromised, it can be rotated by changing the environment variable on the API.
 
-### 4. TanStack Query for Server State
+### 4. Metric Units Only
+
+**Decision**: All measurements use metric units exclusively — liters (L), grams (g), kilograms (kg), milliliters (ml), Celsius (°C).
+
+**Rationale**: Metric is the international standard and simplifies the data model by eliminating unit conversion logic and dual-unit storage. No `temperature_unit` column needed; temperature is always Celsius. The unit enum is strictly `g`, `kg`, `ml`, `L` — no imperial units.
+
+**Trade-off**: None for this user. A client-side display toggle could be added later without changing the database schema if needed.
+
+### 5. TanStack Query for Server State
 
 **Decision**: Use TanStack Query (React Query) for all API data fetching and mutations.
 
-**Rationale**: Provides caching, background refetching, optimistic updates, and request deduplication out of the box. Eliminates the need for manual loading/error state management. Pairs well with a REST API.
+**Rationale**: Provides caching, background refetching, optimistic updates, and request deduplication out of the box. Eliminates the need for manual loading/error state management. Pairs well with a REST API and integrates with the offline caching strategy.
 
 **Trade-off**: Adds a dependency. The alternative — raw `fetch` with `useEffect` — would require significantly more boilerplate for the same functionality.
 
-### 5. nanoid for IDs Instead of Auto-Increment
+### 6. nanoid for IDs Instead of Auto-Increment
 
 **Decision**: Use `nanoid` — 21-character URL-safe strings — for all primary keys.
 
-**Rationale**: URL-safe without encoding, no sequential enumeration, safe for use in QR code URLs, and avoids integer overflow concerns. Generated client-side or server-side without DB coordination.
+**Rationale**: URL-safe without encoding, no sequential enumeration, safe for use in QR code URLs, and avoids integer overflow concerns. Generated client-side or server-side without DB coordination. Enables offline ID generation for the outbox queue.
 
 **Trade-off**: Slightly larger storage than integers. No natural ordering — use `created_at` for ordering instead.
 
-### 6. Client-Side QR Generation
+### 7. Client-Side QR Generation
 
 **Decision**: Generate QR codes in the browser using `qrcode.react` rather than on the server.
 
-**Rationale**: No need to store QR images. The QR is deterministic — same URL always produces the same QR. Client-side generation avoids server load and storage. The `qrcode.react` library renders QR codes as React components (SVG or Canvas), making download/print workflows straightforward.
+**Rationale**: No need to store QR images. The QR is deterministic — same URL always produces the same QR. Client-side generation avoids server load and storage. The `qrcode.react` library renders QR codes as React components (SVG or Canvas), making download/print workflows straightforward. Works offline.
 
 **Trade-off**: Requires JavaScript. Acceptable since QR display is not a critical path.
 
-### 7. Recharts for Gravity Visualization
+### 8. Recharts for Gravity Visualization
 
 **Decision**: Use Recharts for the gravity-over-time chart.
 
@@ -633,17 +729,25 @@ SUPABASE_URL=https://xxxxx.supabase.co
 
 **Trade-off**: Adds bundle size. Can be lazy-loaded with `React.lazy()` and only loaded on the brew detail page.
 
-### 8. Zod for Validation
+### 9. Zod for Validation
 
 **Decision**: Use Zod schemas for both client-side form validation and server-side request validation.
 
 **Rationale**: Single source of truth for validation rules. Integrates well with React Hook Form if needed later. The API must validate input regardless of client-side checks.
 
-### 9. Mobile-First Quick-Log
+### 10. Mobile-First Quick-Log
 
 **Decision**: The `/quick-log/:brewId` route is a separate, mobile-optimized page rather than a modal or the same page as the full log.
 
 **Rationale**: QR scanning happens on a phone. The quick-log page needs large tap targets, minimal scrolling, and fast load times. Keeping it separate allows optimizing the layout and bundle independently.
+
+### 11. Service Worker + IndexedDB for Offline Support
+
+**Decision**: Use a Service Worker for asset caching and IndexedDB for data caching and offline write queuing.
+
+**Rationale**: The app is used at the fermenter where WiFi may be spotty. The user needs to log gravity readings and temperature even without a reliable connection. Service Worker caches the app shell for instant loading. IndexedDB stores API data locally and queues writes in an outbox that syncs when connectivity is restored. This is a proven PWA pattern that works well for single-user apps.
+
+**Trade-off**: Adds complexity to the frontend (Service Worker lifecycle, sync logic, conflict handling). Acceptable because reliable logging at the fermenter is a core use case.
 
 ---
 
@@ -653,10 +757,8 @@ These are explicitly out of scope for v1 but worth noting:
 
 - **Recipe templates**: Save and reuse ingredient lists
 - **Batch cloning**: Duplicate a brew as a starting point
-- **Photo attachments**: Add photos to events (use Supabase Storage or Cloudflare R2)
+- **Photo attachments**: Add photos to events (use Cloudflare R2 or S3-compatible storage)
 - **Export**: Export brew data as JSON or CSV
-- **Multi-user / sharing**: Leverage Supabase Auth for multi-user, share read-only brew pages
-- **PWA support**: Offline access and home screen install for mobile
+- **PWA install prompt**: Home screen install for mobile
 - **Notifications**: Reminders for gravity checks or dry hop schedules
-- **Imperial unit display toggle**: Client-side conversion from metric storage for users who prefer imperial
 - **tRPC migration**: Replace REST with tRPC for end-to-end type safety between frontend and API
